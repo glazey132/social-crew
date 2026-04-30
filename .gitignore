@@ -1,0 +1,37 @@
+# Virtual environment
+venv/
+venv
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Environment secrets (NEVER commit actual secrets)
+.env
+.env.local
+.env.*
+*.key
+*.secret
+
+# Generated files
+outputs/
+pipeline_state.db
+*.db
+
+# System files (macOS)
+.DS_Store
+
+# IDE & editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logging
+*.log
+
+# OS files
+Thumbs.db
