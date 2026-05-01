@@ -98,6 +98,21 @@ Pipeline output:
 - SQLite state in `pipeline_state.db` (unless overridden)
 - Telegram messages for approval review
 
+### Quick: download a single video without running the pipeline
+
+Use `--download URL` to grab a single YouTube video into `DOWNLOADS_DIR` and exit. Skips Telegram, agents, transcription, clipping — pure download.
+
+```bash
+python social_crew.py --download "https://www.youtube.com/watch?v=EvIBrUDnh8s"
+# -> /Users/you/revenue_crew/downloads/EvIBrUDnh8s.mp4
+```
+
+Flags:
+- `--download URL` — the YouTube watch / `youtu.be` link.
+- `--max-resolution N` — override `MAX_DOWNLOAD_RESOLUTION` for this run only (e.g. `--max-resolution 720`).
+
+Uses the configured `DOWNLOAD_BACKEND` (default `pytubefix`). Cached: re-running with the same URL skips the network and returns the existing file.
+
 ## Telegram Approval Commands
 
 Respond with one of:
