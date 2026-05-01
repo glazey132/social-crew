@@ -12,11 +12,17 @@ __pycache__/
 .env
 .env.local
 .env.*
+!.env.example
 *.key
 *.secret
 
+# Browser cookie exports for yt-dlp (never commit)
+cookies.txt
+youtube_cookies.txt
+
 # Generated files
 outputs/
+downloads/
 pipeline_state.db
 *.db
 

@@ -38,6 +38,54 @@ Edit `.env` with your values:
 | `DAILY_CLIP_LIMIT` | No | `3` | Max clips per run |
 | `MAX_CANDIDATES` | No | `5` | Max candidates to evaluate |
 | `DRY_RUN` | No | `false` | Enable testing mode |
+| `SINGLE_TEST_VIDEO_URL` | No | — | If set, discovery returns only this YouTube URL (full `watch?v=` or `youtu.be/` link). Stable id `source_<videoId>` for dedupe. |
+| `OUTPUT_DIR` | No | `${WORKSPACE_DIR}/outputs` | Final rendered clips ready for upload. |
+| `DOWNLOADS_DIR` | No | `${WORKSPACE_DIR}/downloads` | Raw mp4s pulled from YouTube. Cached, so re-runs skip re-downloading. |
+| `DOWNLOAD_BACKEND` | No | `pytubefix` | `pytubefix` (default, no plumbing) or `ytdlp` (legacy, requires cookies + PO token plugin). |
+| `MAX_DOWNLOAD_RESOLUTION` | No | `1080` | Cap on source resolution. TikTok/Shorts/Reels all serve 1080p — 4K just wastes disk and ffmpeg encode time. |
+| `YTDLP_COOKIES_FILE` | No | — | Legacy: Netscape `cookies.txt` path. Only used when `DOWNLOAD_BACKEND=ytdlp`. |
+| `YTDLP_COOKIES_FROM_BROWSER` | No | — | Legacy: e.g. `safari` or `chrome:Default`. Only used when `DOWNLOAD_BACKEND=ytdlp`. |
+| `YTDLP_FORMAT` | No | `18/best[ext=mp4]/best` | Legacy: yt-dlp format selector. |
+| `YTDLP_FORCE_IPV4` | No | `false` | Legacy: pass `source_address=0.0.0.0` to yt-dlp. |
+| `YTDLP_PLAYER_CLIENT` | No | — | Legacy: comma-separated `extractor_args.player_client` list, e.g. `web,tv,android`. |
+
+## Video downloads
+
+The default backend is **[pytubefix](https://github.com/JuanBindez/pytubefix)** — pure Python, ships its own bundled Node.js binary for PO Token generation, no cookies / external server / browser extension required.
+
+Per-video flow:
+1. Pick the highest-resolution H.264 mp4 video stream `≤ MAX_DOWNLOAD_RESOLUTION` (falls back to non-H.264 mp4 if no H.264 available; warned).
+2. Pick the highest-bitrate AAC m4a audio stream.
+3. Download both to a temp subdir of `DOWNLOADS_DIR`.
+4. Merge with `ffmpeg -c copy` (no re-encode) into `${DOWNLOADS_DIR}/<videoId>.mp4`.
+5. Subsequent runs hit the cache and skip the network entirely.
+
+Requirements:
+- `ffmpeg` available on `$PATH`. macOS: `brew install ffmpeg`.
+- Internet from a residential IP. Datacenter IPs are aggressively blocked by YouTube — if you containerize this, plan on a residential proxy.
+
+### Why H.264 / 1080p caps
+
+- TikTok, YouTube Shorts, and Instagram Reels all serve clips at **1080×1920** maximum. 4K source files don't survive the upload re-encode.
+- Every clipping operation re-encodes (subtitle burn, 9:16 crop). H.264 encode/decode on consumer Macs is ~5× faster than AV1 and ~2× faster than VP9.
+- These caps are env-overridable (`MAX_DOWNLOAD_RESOLUTION`) if you ever want to revisit.
+
+### Legacy: yt-dlp + bgutil PO Token (opt-in)
+
+If pytubefix ever breaks on a YouTube change, you can flip to the legacy yt-dlp path:
+
+```bash
+DOWNLOAD_BACKEND=ytdlp
+YTDLP_COOKIES_FILE=cookies.txt
+YTDLP_PLAYER_CLIENT=web,tv,android
+```
+
+That path requires:
+- A fresh Netscape `cookies.txt` exported from your browser (e.g. "Get cookies.txt LOCALLY" extension).
+- The [`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) plugin installed and its Node.js companion server running (see `docs/bgutil-po-token-setup.md`).
+- Tolerance for periodic version-skew bugs between the plugin and yt-dlp's logger API.
+
+This path is intentionally not the default — it's brittle today (April 2026). Background: [yt-dlp issue #12482](https://github.com/yt-dlp/yt-dlp/issues/12482).
 
 ## Run Daily Pipeline
 
@@ -66,6 +114,8 @@ pytest -q
 Unit tests cover:
 - Schema serialization
 - Orchestrator flow and dedupe logic
+- pytubefix download path (stream selection, ffmpeg merge, cache hit, fallbacks)
+- Legacy yt-dlp option building (cookies / format / IPv4 / player_client)
 - State persistence transitions
 - Telegram callback parsing
 

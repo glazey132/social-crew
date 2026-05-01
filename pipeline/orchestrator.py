@@ -15,11 +15,9 @@ from pipeline.schemas import (
     VerificationResult,
 )
 from pipeline.state_store import StateStore
-from tools.clipping import render_clip
 from tools.download import download_video
 from tools.research import discover_candidates
 from tools.telegram import TelegramClient
-from tools.transcribe import transcribe_video
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +30,9 @@ class HermesOrchestrator:
     now_fn: Callable[[], datetime] = datetime.utcnow
 
     def run_daily(self) -> str:
+        from tools.clipping import render_clip
+        from tools.transcribe import transcribe_video
+
         run_id = f"run_{uuid4().hex[:12]}"
         candidates = self._select_candidates(discover_candidates(limit=self.config.max_candidates))
         run = RunRecord.new(run_id=run_id, total_candidates=len(candidates))
@@ -44,7 +45,14 @@ class HermesOrchestrator:
         for candidate in candidates:
             try:
                 source_path = self._with_retries(
-                    lambda: download_video(candidate.url, self.config.output_dir, dry_run=self.config.dry_run),
+                    lambda: download_video(
+                        candidate.url,
+                        self.config.downloads_dir,
+                        dry_run=self.config.dry_run,
+                        max_resolution=self.config.max_download_resolution,
+                        backend=self.config.download_backend,
+                        ytdlp=self.config.ytdlp,
+                    ),
                     operation="download_video",
                     candidate_id=candidate.id,
                 )
