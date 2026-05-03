@@ -7,93 +7,36 @@ has known gaps documented here.
 
 ---
 
-## P0 — blockers for any real end-to-end run
+## Recently resolved May 2026
 
-### `tools/transcribe.py:85` — confidence calc is broken
+Issues that formerly blocked clips from rendering:
 
-Current code:
+| Area | Problem | Fix |
+|------|---------|-----|
+| **Transcript confidence** | Broken generator/`sum(seg.words)` on `Word` objects | Mean of `Word.probability` when `word_timestamps=True`. |
+| **Vertical FFmpeg filter** | Malformed `-vf` (`cropmax`, broken quotes) | `scale=w=1080:h=1920:force_original_aspect_ratio=increase,crop=1080:1920` in [`tools/clipping.py`](tools/clipping.py). |
+| **Segment finder (“0 clips”)** | `_identify_clip_segments` required each raw Whisper line to be ≥13s; Whisper emits 2–10s phrases → every line skipped | Sliding-window merge from each ASR boundary (`_identify_clip_segments` in [`tools/transcribe.py`](tools/transcribe.py); defaults favor **long coherent units** — see `CLIP_*` env; tests in [`tests/test_segmenter.py`](tests/test_segmenter.py)). |
 
-```python
-confidence = (sum(seg.words) for seg in seg.words) / len(seg.words) if seg.words else 0.8
-```
-
-Three problems stacked:
-
-1. `(sum(seg.words) for seg in seg.words)` is a generator expression that
-   shadows the outer loop variable `seg`. Even ignoring the shadow, the
-   contents are wrong — `seg.words` is a list of `faster_whisper.Word`
-   objects, not numbers, so `sum(seg.words)` raises `TypeError`.
-2. Dividing a generator by an int raises `TypeError`.
-3. Even if it ran, the result would be meaningless.
-
-This blocks every transcription call once an actual video reaches the
-function.
-
-Proposed fix:
-
-```python
-confidence = (
-    sum(w.probability for w in seg.words) / len(seg.words)
-    if seg.words else 0.8
-)
-```
-
-`Word.probability` is the per-token confidence score that
-`faster-whisper` exposes when `word_timestamps=True`.
-
----
-
-### `tools/clipping.py:122` — ffmpeg `-vf` filter is malformed
-
-Current code:
-
-```python
-"-vf", f"scale='min(1080*1080/{1080*1080}':1080:-1,'cropmax=1080:1920',crop=1080:1920",
-```
-
-Three problems:
-
-1. `cropmax` is not a real ffmpeg filter. ffmpeg will reject the filter
-   chain outright.
-2. The single quotes are unbalanced. `'min(...` opens an expression that
-   never closes; the `'` in front of `cropmax` opens another that never
-   closes. Even with a valid filter name, this would parse error.
-3. The math `1080*1080/{1080*1080}` evaluates to literal `1` after the
-   f-string substitutes — the expression is a no-op.
-
-**Goal:** scale the source so the *smaller* axis becomes ≥ the target
-dimension, then center-crop to 1080×1920 (TikTok / Shorts / Reels
-portrait).
-
-Proposed fix:
-
-```python
-"-vf", "scale=w=1080:h=1920:force_original_aspect_ratio=increase,"
-       "crop=1080:1920"
-```
-
-`force_original_aspect_ratio=increase` makes ffmpeg pick the larger of
-the two scale factors so neither axis ends up smaller than the target,
-then `crop=1080:1920` (defaults to centered) trims the overflow.
+`faster_whisper` is **lazy-imported** inside `_get_whisper_model()` so pytest can import `_identify_clip_segments` without loading CTranslate2 at collection time.
 
 ---
 
 ## P1 — secondary issues (won't block, but will hurt soon)
 
-- **Whisper model is loaded per call.** `tools/transcribe.py:49`
-  instantiates `WhisperModel(size="medium", device="auto")` inside
-  `transcribe_video()`. The model load (~1 GB to disk, ~30 s on CPU)
-  dominates per-candidate runtime. Cache it module-level (e.g.
-  `functools.lru_cache`) or make it a `dataclass` field that's reused
-  across the loop.
+- **Whisper model load is cached once per process** via
+  `functools.lru_cache` on `_get_whisper_model()`. Retries and
+  multi-source runs reuse the same instance.
+- **`WHISPER_COMPUTE_TYPE` not wired.** Medium weights download as fp16;
+  CPU on Apple Silicon falls back to fp32 (slow, high RAM). Prefer
+  `compute_type=int8` for CPU (faster, smaller) — plumb through env
+  like `WHISPER_MODEL_SIZE`.
 - **Language is hardcoded to English.** `tools/transcribe.py:77` passes
   `language="en"`. Make this configurable via env
   (`TRANSCRIBE_LANGUAGE`, default `"en"`, blank = autodetect).
-- **SRT timestamps break for clips > 60 s.**
-  `tools/clipping.py:72` builds the SRT line as
-  `00:00:{int(duration):02d},000`, so a 90-second clip would write
-  `00:00:90,000` — invalid SRT. Use a proper `H:MM:SS,mmm` formatter,
-  e.g. `f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"`.
+- **SRT sidecar is minimal** (single cue, hook text only). End timestamps
+  use proper `H:MM:SS,mmm` via `_format_srt_timestamp` in
+  [`tools/clipping.py`](tools/clipping.py); burned-in subs on export are a
+  separate path if added later.
 - **Audio is needlessly re-encoded.** `tools/clipping.py` re-encodes
   audio to AAC, but our `pytubefix` source is already AAC at 128 kbps.
   Switch to `-c:a copy` for the rough cut to save time and avoid
@@ -126,13 +69,10 @@ then `crop=1080:1920` (defaults to centered) trims the overflow.
 
 ## Suggested order of attack
 
-1. **Fix `transcribe.py:85` and `clipping.py:122`.** Both P0s. Without
-   them, no end-to-end run produces a real clip.
-2. **Run `python social_crew.py`** with `SINGLE_TEST_VIDEO_URL` set to
-   the test video (`EvIBrUDnh8s`) and watch the full pipeline succeed
-   or surface the next failure.
-3. **Cache the Whisper model.** Single-line fix that immediately
-   makes multi-candidate days viable.
-4. **Decide CrewAI's role** (wire in or delete the factory call).
-5. **Replace demo discovery** with one of the two researched
-   approaches in `docs/`.
+1. **Re-run `python social_crew.py`** with your `SINGLE_TEST_VIDEO_URL`
+   after clearing `processed_sources` if needed. Expect `Found N potential
+   clip segments` where `N >> 0`, then a rendered file in `outputs/`.
+2. **`WHISPER_COMPUTE_TYPE=int8`** wiring + README (CPU speed / RAM).
+3. **Inbound Telegram listener** (`--listen` or webhook).
+4. **Decide CrewAI's role** (wire agents into scoring or drop the stub).
+5. **Replace demo discovery** — curated URL file or Option 2 API.

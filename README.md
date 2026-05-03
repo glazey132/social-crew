@@ -48,6 +48,10 @@ Edit `.env` with your values:
 | `YTDLP_FORMAT` | No | `18/best[ext=mp4]/best` | Legacy: yt-dlp format selector. |
 | `YTDLP_FORCE_IPV4` | No | `false` | Legacy: pass `source_address=0.0.0.0` to yt-dlp. |
 | `YTDLP_PLAYER_CLIENT` | No | — | Legacy: comma-separated `extractor_args.player_client` list, e.g. `web,tv,android`. |
+| `CLIP_MIN_SEC` | No | `20` | Minimum clip length from transcript windows. |
+| `CLIP_MAX_SEC` | No | `180` | Hard cap (favor trimming in TikTok over too-short cuts). |
+| `CLIP_SOFT_BOUNDARY_MIN_SEC` | No | `45` | Do not split on punctuation or silence until at least this duration. |
+| `CLIP_SILENCE_GAP_SEC` | No | `2.0` | Pause (seconds) between Whisper lines to treat as a natural split (only after soft min). |
 
 ## Video downloads
 
@@ -113,6 +117,18 @@ Flags:
 
 Uses the configured `DOWNLOAD_BACKEND` (default `pytubefix`). Cached: re-running with the same URL skips the network and returns the existing file.
 
+## Manual slice (time range to TikTok 9:16)
+
+For a **local** video (e.g. a long cached download under `downloads/`), slice between a **start** and **end** time on the source timeline and encode the **same vertical 1080×1920** output as the main pipeline—no Whisper, no Telegram.
+
+```bash
+python tools/manual_slice.py downloads/YOURVIDEOID.mp4 --start 3660 --end 3960 --hook "Chapter title here"
+```
+
+The script fixes `sys.path` so you normally **do not** need `PYTHONPATH=.`. Outputs go to **`OUTPUT_DIR`** from `.env` by default (`outputs/`), unless you pass `--output-dir`.
+
+**Times:** plain seconds (`3600`, `90.5`), `MM:SS` (`62:45`), or `H:MM:SS` (`1:01:45`). Use `--dry-run` to skip FFmpeg.
+
 ## Telegram Approval Commands
 
 Respond with one of:
@@ -132,5 +148,5 @@ Unit tests cover:
 - pytubefix download path (stream selection, ffmpeg merge, cache hit, fallbacks)
 - Legacy yt-dlp option building (cookies / format / IPv4 / player_client)
 - State persistence transitions
-- Telegram callback parsing
+- Manual time parser (`tools/timeparse`) for HH:MM:SS-style clip bounds
 

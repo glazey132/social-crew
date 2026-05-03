@@ -16,6 +16,20 @@ from pipeline.schemas import ClipSegment, RenderedClip
 
 LOGGER = logging.getLogger(__name__)
 
+
+def _format_srt_timestamp(total_seconds: float) -> str:
+    """SRT end time for a clip that starts at 00:00:00,000 (HH:MM:SS,mmm)."""
+    if total_seconds < 0:
+        total_seconds = 0.0
+    whole = int(total_seconds)
+    ms = int(round((total_seconds - whole) * 1000))
+    if ms >= 1000:
+        ms = 999
+    h, r = divmod(whole, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 # Output format specifications
 OUTPUT_ASPECT_RATIO = "9:16"
 OUTPUT_VIDEO_CODEC = "h264"
@@ -69,11 +83,15 @@ def render_clip(
         )
         
         # Step 2: Generate subtitle file (for reference)
-        subtitle_text = f"1\n00:00:00,000 --> 00:00:{int(segment.end_sec - segment.start_sec):02d},000\n{segment.hook_text}"
+        dur = segment.end_sec - segment.start_sec
+        subtitle_text = (
+            f"1\n00:00:00,000 --> {_format_srt_timestamp(dur)}\n{segment.hook_text}"
+        )
         subtitle_path.write_text(subtitle_text)
         
-        # Step 3: Extract thumbnail at segment start
-        _extract_thumbnail(video_path, thumbnail_path, segment.start_sec)
+        # Step 3: Thumbnail — seek is relative to the *rendered* clip (starts at t=0).
+        # Passing source `segment.start_sec` seeks past EOF on a short output file.
+        _extract_thumbnail(video_path, thumbnail_path, 0.0)
         
         LOGGER.info("Successfully rendered %s (%.1f seconds)", clip_id, segment.end_sec - segment.start_sec)
         
@@ -107,25 +125,24 @@ def _extract_segment(
     - Audio encoded as AAC
     """
     duration = end_time - start_time
-    
-    # FFmpeg command for center crop to 9:16
-    # Input: source (any aspect ratio)
-    # Crop: -vf "scale='min(9*1920/1080,iw)':9:1920, crop=1080:1920"
-    # We first scale to match height, then crop the middle
-    
+
+    # Vertical 9:16 (1080x1920) center-crop:
+    #   1. scale source so the smaller axis >= the target on that axis
+    #      (force_original_aspect_ratio=increase picks the LARGER scale factor)
+    #   2. crop=1080:1920 takes a centered 1080x1920 from the scaled frame
     cmd = [
         "ffmpeg",
-        "-y",  # Overwrite output
-        "-ss", str(start_time),  # Start time
-        "-t", str(duration),  # Duration
-        "-i", str(source_path),  # Input
-        "-vf", f"scale='min(1080*1080/{1080*1080}':1080:-1,'cropmax=1080:1920',crop=1080:1920",  # Crop to 9:16
-        "-c:v", OUTPUT_VIDEO_CODEC,  # Video codec
-        "-c:a", OUTPUT_AUDIO_CODEC,  # Audio codec
-        "-b:a", "128k",  # Audio bitrate
-        "-preset", "medium",  # Encoding speed/quality tradeoff
-        "-r", str(OUTPUT_FPS),  # Frame rate
-        "-pix_fmt", "yuv420p",  # Compatible pixel format
+        "-y",
+        "-ss", str(start_time),
+        "-t", str(duration),
+        "-i", str(source_path),
+        "-vf", "scale=w=1080:h=1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "-c:v", OUTPUT_VIDEO_CODEC,
+        "-c:a", OUTPUT_AUDIO_CODEC,
+        "-b:a", "128k",
+        "-preset", "medium",
+        "-r", str(OUTPUT_FPS),
+        "-pix_fmt", "yuv420p",
         str(output_path),
     ]
     
@@ -144,12 +161,10 @@ def _extract_segment(
 
 def _extract_thumbnail(video_path: Path, output_path: Path, timestamp: float) -> None:
     """
-    Extract a high-quality thumbnail from the video at a specific timestamp.
-    
-    Args:
-        video_path: Source video path
-        output_path: Where to save thumbnail
-        timestamp: Time in seconds to extract frame
+    Extract one frame from the given media file.
+
+    ``timestamp`` is in **seconds from the start of ``video_path``** (timeline of
+    that file). For thumbnails of a freshly rendered clip, use ``0.0``.
     """
     cmd = [
         "ffmpeg",

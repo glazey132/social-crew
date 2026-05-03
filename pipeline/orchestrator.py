@@ -88,7 +88,13 @@ class HermesOrchestrator:
         )
 
         self.telegram.send_approval_bundle(run_id=run_id, items=approval_items, dry_run=self.config.dry_run)
-        self.state_store.add_processed_sources([c.id for c in candidates], processed_at=self.now_fn().isoformat())
+
+        # Only mark candidates as processed if they reached a rendered clip. Failed downloads,
+        # failed transcribes, and segment-less videos must be retryable on the next run; otherwise
+        # one transient failure permanently bans the source from future runs.
+        rendered_ids = sorted({clip.candidate_id for clip in rendered_clips})
+        if rendered_ids:
+            self.state_store.add_processed_sources(rendered_ids, processed_at=self.now_fn().isoformat())
         return run_id
 
     def handle_telegram_decision(self, run_id: str, clip_id: str, decision: str) -> None:

@@ -1,54 +1,111 @@
 """
 Video transcription and clip segment detection using Whisper.
 
-Identifies high-engagement segments (15-60 seconds) suitable for short-form content.
+Identifies coherent watchable arcs from transcript (bounded by ``CLIP_*`` env).
+Prefer longer units you can trim in-app over short ambiguous cuts.
 Uses faster-whisper for efficient on-device speech recognition.
 """
 
+import functools
 import logging
+import os
 import subprocess
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
-from faster_whisper import WhisperModel
 from pipeline.schemas import ClipSegment
 
 LOGGER = logging.getLogger(__name__)
 
-# Segment constraints for short-form content
-MIN_DURATION_SEC = 15
-MAX_DURATION_SEC = 60
 MIN_CONFIDENCE = 0.35
 
 
-def transcribe_video(source_path: Union[str, Path]) -> List[ClipSegment]:
+def _clip_strategy_bounds() -> Tuple[float, float, float, float]:
+    """(min_duration, max_duration, soft_boundary_min, silence_gap).
+
+    Soft boundary: do not split on punctuation or silence until duration is at least
+    this large (errs long toward a coherent "unit").
     """
-    Transcribe video and identify optimal clip segments using Whisper.
-    
-    Uses a strategy that focuses on high-confidence, complete thoughts:
-    - Finds sentences/phrases that form coherent segments
-    - Prioritizes segments with strong opening phrases
-    - Ensures segments are between 15-60 seconds
-    
-    Args:
-        source_path: Path to downloaded video file
-        
-    Returns:
-        List of ClipSegment objects sorted by confidence score
+    mn = float(os.getenv("CLIP_MIN_SEC", "20"))
+    mx = float(os.getenv("CLIP_MAX_SEC", "180"))
+    soft = float(os.getenv("CLIP_SOFT_BOUNDARY_MIN_SEC", "45"))
+    gap = float(os.getenv("CLIP_SILENCE_GAP_SEC", "2.0"))
+    if mx < mn:
+        mn, mx = mx, mn
+    if soft < mn:
+        soft = mn
+    return mn, mx, soft, gap
+
+
+def _silence_gap_sec(segments: List[Tuple[float, float, str, float]], prev_j: int, next_j: int) -> float:
+    """Time between end of Whisper segment prev_j and start of next_j."""
+    return segments[next_j][0] - segments[prev_j][1]
+
+
+def _text_looks_complete_sentence(text: str) -> bool:
+    """Rough check for clause / sentence boundary at end of transcript text."""
+    t = text.strip()
+    if not t:
+        return False
+    for suf in ('"', "'", ")", "]", "»"):
+        while t.endswith(suf):
+            t = t[:-1].rstrip()
+    return bool(t[-1] in ".!?…")
+
+
+def _emit_clip_window(
+    candidate_id: str,
+    start_t: float,
+    end_t: float,
+    texts: List[str],
+    confs: List[float],
+    *,
+    min_sec: float,
+    max_sec: float,
+) -> Optional[ClipSegment]:
+    duration = end_t - start_t
+    if duration < min_sec or duration > max_sec + 0.001:
+        return None
+    avg_conf = sum(confs) / len(confs)
+    if avg_conf < MIN_CONFIDENCE:
+        return None
+    full_text = " ".join(texts)
+    score = _calculate_engagement_score(full_text, avg_conf, duration)
+    return ClipSegment(
+        candidate_id=candidate_id,
+        start_sec=start_t,
+        end_sec=end_t,
+        hook_text=_generate_hook_text(full_text),
+        confidence=score,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _get_whisper_model(model_size: str, device: str) -> Any:
+    """Module-level model cache."""
+    from faster_whisper import WhisperModel
+
+    LOGGER.info("Loading WhisperModel size=%s device=%s (one-time per process)", model_size, device)
+    return WhisperModel(model_size, device=device)
+
+
+def transcribe_video(source_path: Union[str, Path]) -> List[ClipSegment]:
+    """Transcribe video and identify optimal clip segments using Whisper.
+
+    Reads model size from env `WHISPER_MODEL_SIZE` (default `medium`) and
+    device from `WHISPER_DEVICE` (default `auto` — picks CUDA/MPS/CPU).
     """
     source_path = Path(source_path)
     if not source_path.exists():
         raise FileNotFoundError(f"Video file not found: {source_path}")
-    
-    # Determine candidate ID from filename
+
     candidate_id = source_path.stem
-    
     LOGGER.info("Starting transcription for %s", candidate_id)
-    
-    # Initialize Whisper model (uses CPU by default, can be configured for GPU)
-    model = WhisperModel(size="medium", device="auto")
-    
-    # Get raw transcript using the Whisper model
+
+    model_size = os.getenv("WHISPER_MODEL_SIZE", "medium").strip() or "medium"
+    device = os.getenv("WHISPER_DEVICE", "auto").strip() or "auto"
+    model = _get_whisper_model(model_size, device)
+
     segments = _transcribe_to_segments(model, str(source_path))
     
     # Post-process to find optimal clip segments
@@ -59,7 +116,7 @@ def transcribe_video(source_path: Union[str, Path]) -> List[ClipSegment]:
     return sorted(clip_candidates, key=lambda s: s.confidence, reverse=True)
 
 
-def _transcribe_to_segments(model: WhisperModel, video_path: str) -> List[Tuple[float, float, str, float]]:
+def _transcribe_to_segments(model: Any, video_path: str) -> List[Tuple[float, float, str, float]]:
     """
     Transcribe video and return segments with timestamps.
     
@@ -79,15 +136,17 @@ def _transcribe_to_segments(model: WhisperModel, video_path: str) -> List[Tuple[
             word_timestamps=True
         )
         
-        # Convert to our format: (start, end, text, confidence)
         result = []
         for seg in segments:
-            confidence = (sum(seg.words) for seg in seg.words) / len(seg.words) if seg.words else 0.8
+            if seg.words:
+                confidence = sum(w.probability for w in seg.words) / len(seg.words)
+            else:
+                confidence = 0.8
             result.append((
                 seg.start,
                 seg.end,
                 seg.text,
-                confidence
+                confidence,
             ))
         
         LOGGER.info("Extracted %d transcript segments", len(result))
@@ -99,80 +158,89 @@ def _transcribe_to_segments(model: WhisperModel, video_path: str) -> List[Tuple[
 
 
 def _identify_clip_segments(segments: List[Tuple[float, float, str, float]], candidate_id: str) -> List[ClipSegment]:
+    """Build ``CLIP_MIN_SEC``–``CLIP_MAX_SEC`` windows from Whisper fragments.
+
+    Stops merging when:
+    - after ``CLIP_SOFT_BOUNDARY_MIN_SEC`` s: punctuation looks like clause end, **or**
+    - same threshold: silence ≥ ``CLIP_SILENCE_GAP_SEC`` before next line, **or**
+    - hard cap ``CLIP_MAX_SEC``.
+
+    Earlier sentence boundaries are ignored so windows stay coherent (trim later).
     """
-    Identify optimal clip segments from transcript segments.
-    
-    Strategy:
-    - Look for coherent thoughts that complete in 15-60 seconds
-    - Prioritize segments with high confidence scores
-    - Focus on segments with engaging openings (questions, strong statements)
-    """
-    clip_candidates = []
-    
-    # Group consecutive segments into potential clips
-    i = 0
-    while i < len(segments):
-        current_start, current_end, current_text, current_conf = segments[i]
-        
-        # Skip very short segments
-        if current_end - current_start < MIN_DURATION_SEC - 2:
-            i += 1
-            continue
-        
-        # Try to extend segment to capture complete thought
-        best_end = current_end
-        best_text = current_text
-        best_conf = current_conf
-        
-        for j in range(i + 1, min(i + 5, len(segments))):
-            next_start, next_end, next_text, next_conf = segments[j]
-            
-            # Check for natural break (gap > 1s or new sentence)
-            gap = next_start - best_end
-            if gap > 1.0 or next_text.startswith(('And', 'But', 'So', 'Well', 'Okay')):
-                break
-            
-            # Update best segment
-            best_end = next_end
-            best_text = f"{best_text} {next_text}"
-            best_conf = (best_conf + next_conf) / 2
-        
-        # Only keep if duration is appropriate
-        duration = best_end - current_start
-        if MIN_DURATION_SEC <= duration <= MAX_DURATION_SEC and best_conf >= MIN_CONFIDENCE:
-            # Score based on confidence and engagement signals
-            score = _calculate_engagement_score(best_text, best_conf, duration)
-            
-            clip_candidates.append(
-                ClipSegment(
-                    candidate_id=candidate_id,
-                    start_sec=current_start,
-                    end_sec=best_end,
-                    hook_text=_generate_hook_text(best_text),
-                    confidence=score
-                )
-            )
-        
-        i += 1
-    
-    # Always include at least the best 3 segments if we found any
-    if not clip_candidates and segments:
-        # Fallback: take the first three potential segments
-        for i in range(min(3, len(segments))):
-            start, end, text, conf = segments[i]
-            duration = end - start
-            if MIN_DURATION_SEC <= duration <= MAX_DURATION_SEC:
-                clip_candidates.append(
-                    ClipSegment(
-                        candidate_id=candidate_id,
-                        start_sec=start,
-                        end_sec=end,
-                        hook_text=_generate_hook_text(text),
-                        confidence=conf
+    min_sec, max_sec, soft_sec, silence_gap = _clip_strategy_bounds()
+    candidates: List[ClipSegment] = []
+    n = len(segments)
+
+    for i in range(n):
+        start_t = segments[i][0]
+        texts: List[str] = []
+        confs: List[float] = []
+        emitted = False
+
+        for j in range(i, n):
+            s0, s1, st, sc = segments[j]
+
+            if j > i and silence_gap > 0:
+                gap = _silence_gap_sec(segments, j - 1, j)
+                if gap >= silence_gap:
+                    prev_end = segments[j - 1][1]
+                    if prev_end - start_t >= soft_sec:
+                        clip = _emit_clip_window(
+                            candidate_id, start_t, prev_end, texts, confs,
+                            min_sec=min_sec, max_sec=max_sec,
+                        )
+                        if clip is not None:
+                            candidates.append(clip)
+                            emitted = True
+                        break
+
+            if s1 - start_t > max_sec:
+                if j > i:
+                    prev_end = segments[j - 1][1]
+                    clip = _emit_clip_window(
+                        candidate_id, start_t, prev_end, texts, confs,
+                        min_sec=min_sec, max_sec=max_sec,
                     )
-                )
-    
-    return clip_candidates
+                    if clip is not None:
+                        candidates.append(clip)
+                        emitted = True
+                break
+
+            texts.append(st.strip())
+            confs.append(sc)
+            dur = s1 - start_t
+            full = " ".join(texts)
+
+            if dur >= min_sec:
+                if dur >= soft_sec and _text_looks_complete_sentence(full):
+                    clip = _emit_clip_window(
+                        candidate_id, start_t, s1, texts, confs,
+                        min_sec=min_sec, max_sec=max_sec,
+                    )
+                    if clip is not None:
+                        candidates.append(clip)
+                        emitted = True
+                    break
+                if dur >= max_sec - 1e-6:
+                    clip = _emit_clip_window(
+                        candidate_id, start_t, s1, texts, confs,
+                        min_sec=min_sec, max_sec=max_sec,
+                    )
+                    if clip is not None:
+                        candidates.append(clip)
+                        emitted = True
+                    break
+
+        if not emitted and texts:
+            last_end = segments[i + len(texts) - 1][1]
+            clip = _emit_clip_window(
+                candidate_id, start_t, last_end, texts, confs,
+                min_sec=min_sec, max_sec=max_sec,
+            )
+            if clip is not None:
+                candidates.append(clip)
+
+    return candidates
 
 
 def _get_video_duration(video_path: str) -> float:
@@ -197,23 +265,30 @@ def _calculate_engagement_score(text: str, confidence: float, duration: float) -
     Factors:
     - Base score from whisper confidence
     - +0.1 if text starts with engaging words
-    - +0.05 if text length is optimal for short-form
+    - mild bonus for longer arcs (users trim in-app; short clips rank lower)
     """
     base_score = confidence
-    
+
+    if _text_looks_complete_sentence(text):
+        base_score += 0.12
+    else:
+        base_score -= 0.03
+
     # Engagement boosters
     engaging_starters = ['Why', 'What', 'How', 'Can', 'Would', 'Did', 'When', 'Who']
     if text.split()[0] in engaging_starters if text.split() else False:
         base_score += 0.1
     
-    # Optimal text length
     word_count = len(text.split())
-    if 10 <= word_count <= 30:
+    if 10 <= word_count <= 120:
         base_score += 0.05
-    
-    # Short duration bonus
-    if duration < 30:
+
+    if duration >= 90:
+        base_score += 0.08
+    elif duration >= 55:
         base_score += 0.05
+    elif duration < 30:
+        base_score -= 0.06
     
     return min(1.0, base_score)
 
